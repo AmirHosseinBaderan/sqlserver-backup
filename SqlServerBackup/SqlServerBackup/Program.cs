@@ -1,71 +1,78 @@
-﻿using Microsoft.Data.SqlClient;
-using Minio;
+﻿using Minio;
 using Minio.DataModel.Args;
+using Renci.SshNet;
 using System.IO.Compression;
 using static System.Console;
 
-// Get SQL Server details
-string sqlServer = GetValidInput("Enter SQL Server address: ");
-string sqlUser = GetValidInput("Enter SQL Server username: ");
-string sqlPass = GetValidPassword("Enter SQL Server password: ");
-
-// Get MinIO details
-string minioEndpoint = GetValidInput("Enter MinIO endpoint (e.g., http://127.0.0.1:9000): ");
+// Get connection details
+string serverIp = GetValidInput("Enter Remote Server IP: ");
+string sshUser = GetValidInput("Enter SSH username: ");
+string sshPass = GetValidPassword("Enter SSH password: ");
+string dockerContainer = GetValidInput("Enter SQL Server Docker container name: ");
+string minioEndpoint = GetValidInput("Enter MinIO endpoint: ");
 string minioAccessKey = GetValidInput("Enter MinIO access key: ");
 string minioSecretKey = GetValidPassword("Enter MinIO secret key: ");
 string bucketName = GetValidInput("Enter MinIO bucket name: ");
 
-// Backup process
 string backupDate = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
-string backupDir = $"C:\\DatabaseBackups_{backupDate}";
-Directory.CreateDirectory(backupDir);
+string containerBackupDir = "/var/opt/mssql/backups";
+string serverBackupDir = $"/home/{sshUser}/DatabaseBackups_{backupDate}";
+string localBackupDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), $"DatabaseBackups_{backupDate}");
+string zipFilePath = $"{localBackupDir}.zip";
 
-await BackupDatabases(sqlServer, sqlUser, sqlPass, backupDir);
+// Establish SSH connection
+using var sshClient = new SshClient(serverIp, sshUser, sshPass);
+sshClient.Connect();
+WriteLine("✔ Connected to remote server");
 
-string zipFilePath = $"{backupDir}.zip";
-ZipFile.CreateFromDirectory(backupDir, zipFilePath);
+// Step 1️⃣: Ensure backup directory exists in Docker
+ExecuteRemoteCommand($"sudo docker exec {dockerContainer} mkdir -p {containerBackupDir}");
 
+// Step 2️⃣: Run SQL Server Backup Inside Docker
+ExecuteRemoteCommand($"sudo docker exec {dockerContainer} /opt/mssql-tools/bin/sqlcmd -S localhost -U SA -P '{sshPass}' -Q \"DECLARE @name NVARCHAR(MAX) SELECT @name=name FROM sys.databases WHERE name NOT IN ('master', 'tempdb', 'model', 'msdb') BACKUP DATABASE @name TO DISK = '{containerBackupDir}/'+@name+'.bak'\"");
+WriteLine("✔ Backup completed inside Docker");
+
+// Ensure backup directory exists on the remote server
+ExecuteRemoteCommand($"mkdir -p {serverBackupDir}");
+
+// Step 3️⃣: Copy Backups From Docker to Remote Server
+ExecuteRemoteCommand($"sudo docker cp {dockerContainer}:{containerBackupDir} {serverBackupDir}");
+WriteLine("✔ Backup files copied to server");
+
+// Step 4️⃣: Download Backups from Remote Server to Local Machine
+DownloadBackupFiles(serverIp, sshUser, sshPass, serverBackupDir, localBackupDir);
+WriteLine("✔ Backup files downloaded to local machine");
+
+// Step 5️⃣: Zip Backup Files
+ZipFile.CreateFromDirectory(localBackupDir, zipFilePath);
+WriteLine("✔ Backup files compressed");
+
+// Step 6️⃣: Upload ZIP File to MinIO
 await UploadToMinIO(minioEndpoint, minioAccessKey, minioSecretKey, bucketName, zipFilePath);
+WriteLine("✔ Backup uploaded to MinIO");
 
-WriteLine("\nBackup completed and uploaded successfully!");
+sshClient.Disconnect();
+WriteLine("\n🎉 Backup process completed successfully!");
 
-// Functions
-async Task BackupDatabases(string sqlServer, string user, string password, string backupDir)
+// Utility Functions
+void ExecuteRemoteCommand(string command)
 {
-    using SqlConnection connection = new($"Server={sqlServer};User Id={user};Password={password};TrustServerCertificate=True");
-    await connection.OpenAsync();
-
-    // Step 1: Get all database names first
-    List<string> databaseNames = new();
-    using SqlCommand command = new("SELECT name FROM sys.databases WHERE name NOT IN ('master', 'tempdb', 'model', 'msdb')", connection);
-    using SqlDataReader reader = await command.ExecuteReaderAsync();
-
-    while (await reader.ReadAsync()) // Ensure async reading
-    {
-        databaseNames.Add(reader.GetString(0));
-    }
-
-    reader.Close(); // Close reader before executing new commands
-
-    // Step 2: Execute backup commands separately
-    foreach (string databaseName in databaseNames)
-    {
-        string backupPath = Path.Combine(backupDir, $"{databaseName}.bak");
-
-        using SqlCommand backupCommand = new($"BACKUP DATABASE [{databaseName}] TO DISK = '{backupPath}'", connection);
-        await backupCommand.ExecuteNonQueryAsync();
-        Console.WriteLine($"✔ Backup completed for {databaseName}");
-    }
+    using var cmd = sshClient.RunCommand(command);
+    WriteLine(cmd.Result);
 }
 
+void DownloadBackupFiles(string serverIp, string sshUser, string sshPass, string remotePath, string localPath)
+{
+    using var scpClient = new ScpClient(serverIp, sshUser, sshPass);
+    scpClient.Connect();
+    Directory.CreateDirectory(localPath);
+    scpClient.Download(remotePath, new DirectoryInfo(localPath));
+    scpClient.Disconnect();
+}
 
 async Task UploadToMinIO(string endpoint, string accessKey, string secretKey, string bucketName, string filePath)
 {
-    var minioClient = new MinioClient()
-        .WithEndpoint(endpoint)
-        .WithCredentials(accessKey, secretKey)
-        .Build();
-
+    var minioClient = new MinioClient().WithEndpoint(endpoint).WithCredentials(accessKey, secretKey).Build();
     using var fileStream = new FileStream(filePath, FileMode.Open);
 
     var objectArgs = new PutObjectArgs()
@@ -76,26 +83,29 @@ async Task UploadToMinIO(string endpoint, string accessKey, string secretKey, st
         .WithContentType("application/zip");
 
     await minioClient.PutObjectAsync(objectArgs);
-
-    Console.WriteLine($"✔ Backup file uploaded to MinIO: {bucketName}/{Path.GetFileName(filePath)}");
+    WriteLine($"✔ Backup file uploaded to MinIO: {bucketName}/{Path.GetFileName(filePath)}");
 }
 
-// Securely read a password while masking input
-string GetValidPassword(string prompt)
+string GetValidInput(string prompt)
 {
-    string password;
+    string? input;
     do
     {
         Write(prompt);
-        password = ReadPassword();
-        if (string.IsNullOrEmpty(password))
-            WriteLine("❌ Password cannot be empty! Please enter a valid password.");
-    } while (string.IsNullOrEmpty(password));
+        input = ReadLine()?.Trim();
+        if (string.IsNullOrEmpty(input))
+            WriteLine("❌ Input cannot be empty! Please enter a valid value.");
+    } while (string.IsNullOrEmpty(input));
 
-    return password;
+    return input;
 }
 
-// Secure password input masking
+string GetValidPassword(string prompt)
+{
+    Write(prompt);
+    return ReadPassword();
+}
+
 string ReadPassword()
 {
     string password = "";
@@ -116,19 +126,4 @@ string ReadPassword()
     }
     WriteLine();
     return password;
-}
-
-// Validate input, ensuring no empty or null values
-string GetValidInput(string prompt)
-{
-    string? input;
-    do
-    {
-        Write(prompt);
-        input = ReadLine()?.Trim();
-        if (string.IsNullOrEmpty(input))
-            WriteLine("❌ Input cannot be empty! Please enter a valid value.");
-    } while (string.IsNullOrEmpty(input));
-
-    return input;
 }
