@@ -3,43 +3,50 @@ using Minio;
 using Minio.DataModel.Args;
 using Renci.SshNet;
 using System.IO.Compression;
+using System.Text.Json;
 using static System.Console;
 
-// Get connection details
-string serverIp = GetValidInput("Enter Remote Server IP: ");
-string sshUser = GetValidInput("Enter SSH username: ");
-string sshPass = GetValidPassword("Enter SSH password: ");
-string sqlServerAddress = GetValidInput("Enter SQL Server Address: ");
-string sqlUser = GetValidInput("Enter SQL Server username: ");
-string sqlPass = GetValidPassword("Enter SQL Server password: ");
-string dockerContainer = GetValidInput("Enter SQL Server Docker container name: ");
-string minioEndpoint = GetValidInput("Enter MinIO endpoint: ");
-string minioAccessKey = GetValidInput("Enter MinIO access key: ");
-string minioSecretKey = GetValidPassword("Enter MinIO secret key: ");
-string bucketName = GetValidInput("Enter MinIO bucket name: ");
+Write("Enter the path to the configuration JSON file: ");
+string? configPath = ReadLine()?.Trim();
+
+if (string.IsNullOrEmpty(configPath) || !File.Exists(configPath))
+{
+    WriteLine("❌ Configuration file not found! Please provide a valid JSON path.");
+    return;
+}
+
+// Read and deserialize the JSON file
+var configJson = File.ReadAllText(configPath);
+var config = JsonSerializer.Deserialize<Config>(configJson);
+
+if (config == null)
+{
+    WriteLine("❌ Failed to read configuration file!");
+    return;
+}
 
 string backupDate = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
 string containerBackupDir = "/var/opt/mssql/backups";
-string serverBackupDir = $"/home/{sshUser}/DatabaseBackups_{backupDate}";
+string serverBackupDir = $"/home/{config.sshUser}/DatabaseBackups_{backupDate}";
 string localBackupDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), $"DatabaseBackups_{backupDate}");
 string zipFilePath = $"{localBackupDir}.zip";
 
 // Step 1️: Run SQL Server Backup
 WriteLine("✔ Connecting to SQL Server for backup...");
-BackupDatabases(sqlServerAddress, sqlUser, sqlPass, containerBackupDir);
+BackupDatabases(config.sqlServerAddress, config.sqlUser, config.sqlPass, containerBackupDir);
 
 // Step 2️: Ensure backup directory exists in Docker
-using var sshClient = new SshClient(serverIp, sshUser, sshPass);
+using var sshClient = new SshClient(config.serverIp, config.sshUser, config.sshPass);
 sshClient.Connect();
 WriteLine("✔ Connected to remote server");
-ExecuteRemoteCommand($"sudo docker exec {dockerContainer} mkdir -p {containerBackupDir}");
+ExecuteRemoteCommand($"sudo docker exec {config.dockerContainer} mkdir -p {containerBackupDir}");
 
 // Step 3️: Copy Backups From Docker to Remote Server
-ExecuteRemoteCommand($"sudo docker cp {dockerContainer}:{containerBackupDir} {serverBackupDir}");
+ExecuteRemoteCommand($"sudo docker cp {config.dockerContainer}:{containerBackupDir} {serverBackupDir}");
 WriteLine("✔ Backup files copied to server");
 
 // Step 4️: Download Backups from Remote Server to Local Machine
-DownloadBackupFiles(serverIp, sshUser, sshPass, serverBackupDir, localBackupDir);
+DownloadBackupFiles(config.serverIp, config.sshUser, config.sshPass, serverBackupDir, localBackupDir);
 WriteLine("✔ Backup files downloaded to local machine");
 
 // Step 5️: Delete Backup Directory on Remote Server
@@ -47,7 +54,7 @@ ExecuteRemoteCommand($"rm -rf {serverBackupDir}");
 WriteLine($"✔ Deleted backup directory on remote server: {serverBackupDir}");
 
 // Step 6️: Delete Backup Files from Docker Container
-ExecuteRemoteCommand($"sudo docker exec {dockerContainer} rm -rf {containerBackupDir}");
+ExecuteRemoteCommand($"sudo docker exec {config.dockerContainer} rm -rf {containerBackupDir}");
 WriteLine($"✔ Deleted backup files from Docker container: {containerBackupDir}");
 
 
@@ -56,7 +63,7 @@ ZipFile.CreateFromDirectory(localBackupDir, zipFilePath);
 WriteLine("✔ Backup files compressed");
 
 // Step 8: Upload ZIP File to MinIO
-await UploadToMinIO(minioEndpoint, minioAccessKey, minioSecretKey, bucketName, zipFilePath);
+await UploadToMinIO(config.minioEndpoint, config.minioAccessKey, config.minioSecretKey, config.bucketName, zipFilePath);
 WriteLine("✔ Backup uploaded to MinIO");
 
 sshClient.Disconnect();
