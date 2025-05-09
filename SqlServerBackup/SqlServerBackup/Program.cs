@@ -1,4 +1,5 @@
-﻿using Minio;
+﻿using Microsoft.Data.SqlClient;
+using Minio;
 using Minio.DataModel.Args;
 using Renci.SshNet;
 using System.IO.Compression;
@@ -8,6 +9,9 @@ using static System.Console;
 string serverIp = GetValidInput("Enter Remote Server IP: ");
 string sshUser = GetValidInput("Enter SSH username: ");
 string sshPass = GetValidPassword("Enter SSH password: ");
+string sqlServerAddress = GetValidInput("Enter SQL Server Address: ");
+string sqlUser = GetValidInput("Enter SQL Server username: ");
+string sqlPass = GetValidPassword("Enter SQL Server password: ");
 string dockerContainer = GetValidInput("Enter SQL Server Docker container name: ");
 string minioEndpoint = GetValidInput("Enter MinIO endpoint: ");
 string minioAccessKey = GetValidInput("Enter MinIO access key: ");
@@ -20,34 +24,38 @@ string serverBackupDir = $"/home/{sshUser}/DatabaseBackups_{backupDate}";
 string localBackupDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), $"DatabaseBackups_{backupDate}");
 string zipFilePath = $"{localBackupDir}.zip";
 
-// Establish SSH connection
+// Step 1️: Run SQL Server Backup
+WriteLine("✔ Connecting to SQL Server for backup...");
+BackupDatabases(sqlServerAddress, sqlUser, sqlPass, containerBackupDir);
+
+// Step 2️: Ensure backup directory exists in Docker
 using var sshClient = new SshClient(serverIp, sshUser, sshPass);
 sshClient.Connect();
 WriteLine("✔ Connected to remote server");
-
-// Step 1️⃣: Ensure backup directory exists in Docker
 ExecuteRemoteCommand($"sudo docker exec {dockerContainer} mkdir -p {containerBackupDir}");
 
-// Step 2️⃣: Run SQL Server Backup Inside Docker
-ExecuteRemoteCommand($"sudo docker exec {dockerContainer} /opt/mssql-tools/bin/sqlcmd -S localhost -U SA -P '{sshPass}' -Q \"DECLARE @name NVARCHAR(MAX) SELECT @name=name FROM sys.databases WHERE name NOT IN ('master', 'tempdb', 'model', 'msdb') BACKUP DATABASE @name TO DISK = '{containerBackupDir}/'+@name+'.bak'\"");
-WriteLine("✔ Backup completed inside Docker");
-
-// Ensure backup directory exists on the remote server
-ExecuteRemoteCommand($"mkdir -p {serverBackupDir}");
-
-// Step 3️⃣: Copy Backups From Docker to Remote Server
+// Step 3️: Copy Backups From Docker to Remote Server
 ExecuteRemoteCommand($"sudo docker cp {dockerContainer}:{containerBackupDir} {serverBackupDir}");
 WriteLine("✔ Backup files copied to server");
 
-// Step 4️⃣: Download Backups from Remote Server to Local Machine
+// Step 4️: Download Backups from Remote Server to Local Machine
 DownloadBackupFiles(serverIp, sshUser, sshPass, serverBackupDir, localBackupDir);
 WriteLine("✔ Backup files downloaded to local machine");
 
-// Step 5️⃣: Zip Backup Files
+// Step 5️: Delete Backup Directory on Remote Server
+ExecuteRemoteCommand($"rm -rf {serverBackupDir}");
+WriteLine($"✔ Deleted backup directory on remote server: {serverBackupDir}");
+
+// Step 6️: Delete Backup Files from Docker Container
+ExecuteRemoteCommand($"sudo docker exec {dockerContainer} rm -rf {containerBackupDir}");
+WriteLine($"✔ Deleted backup files from Docker container: {containerBackupDir}");
+
+
+// Step 57: Zip Backup Files
 ZipFile.CreateFromDirectory(localBackupDir, zipFilePath);
 WriteLine("✔ Backup files compressed");
 
-// Step 6️⃣: Upload ZIP File to MinIO
+// Step 8: Upload ZIP File to MinIO
 await UploadToMinIO(minioEndpoint, minioAccessKey, minioSecretKey, bucketName, zipFilePath);
 WriteLine("✔ Backup uploaded to MinIO");
 
@@ -55,6 +63,35 @@ sshClient.Disconnect();
 WriteLine("\n🎉 Backup process completed successfully!");
 
 // Utility Functions
+void BackupDatabases(string sqlServer, string user, string password, string backupDir)
+{
+    using SqlConnection connection = new($"Server={sqlServer};User Id={user};Password={password};TrustServerCertificate=True");
+    connection.Open();
+
+    // Step 1️⃣: Get database names first and store them in a list
+    List<string> databaseNames = new();
+    using SqlCommand command = new("SELECT name FROM sys.databases WHERE name NOT IN ('master', 'tempdb', 'model', 'msdb')", connection);
+    using SqlDataReader reader = command.ExecuteReader();
+
+    while (reader.Read())
+    {
+        databaseNames.Add(reader.GetString(0));
+    }
+
+    reader.Close(); // Ensure reader is closed before executing new commands
+
+    // Step 2️⃣: Execute backup commands separately
+    foreach (string databaseName in databaseNames)
+    {
+        string backupPath = $"{backupDir}/{databaseName}.bak";
+
+        using SqlCommand backupCommand = new($"BACKUP DATABASE [{databaseName}] TO DISK = '{backupPath}'", connection);
+        backupCommand.ExecuteNonQuery();
+        WriteLine($"✔ Backup completed for {databaseName}");
+    }
+}
+
+
 void ExecuteRemoteCommand(string command)
 {
     using var cmd = sshClient.RunCommand(command);
@@ -65,6 +102,7 @@ void DownloadBackupFiles(string serverIp, string sshUser, string sshPass, string
 {
     using var scpClient = new ScpClient(serverIp, sshUser, sshPass);
     scpClient.Connect();
+    ExecuteRemoteCommand($"sudo chmod -R 777 {remotePath}");
     Directory.CreateDirectory(localPath);
     scpClient.Download(remotePath, new DirectoryInfo(localPath));
     scpClient.Disconnect();
