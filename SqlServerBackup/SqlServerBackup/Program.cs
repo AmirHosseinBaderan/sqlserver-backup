@@ -20,7 +20,7 @@ string backupDate = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
 string backupDir = $"C:\\DatabaseBackups_{backupDate}";
 Directory.CreateDirectory(backupDir);
 
-BackupDatabases(sqlServer, sqlUser, sqlPass, backupDir);
+await BackupDatabases(sqlServer, sqlUser, sqlPass, backupDir);
 
 string zipFilePath = $"{backupDir}.zip";
 ZipFile.CreateFromDirectory(backupDir, zipFilePath);
@@ -30,24 +30,34 @@ await UploadToMinIO(minioEndpoint, minioAccessKey, minioSecretKey, bucketName, z
 WriteLine("\nBackup completed and uploaded successfully!");
 
 // Functions
-void BackupDatabases(string sqlServer, string user, string password, string backupDir)
+async Task BackupDatabases(string sqlServer, string user, string password, string backupDir)
 {
-    using var connection = new SqlConnection($"Server={sqlServer};User Id={user};Password={password};");
-    connection.Open();
+    using SqlConnection connection = new($"Server={sqlServer};User Id={user};Password={password};TrustServerCertificate=True");
+    await connection.OpenAsync();
 
+    // Step 1: Get all database names first
+    List<string> databaseNames = new();
     using SqlCommand command = new("SELECT name FROM sys.databases WHERE name NOT IN ('master', 'tempdb', 'model', 'msdb')", connection);
-    using var reader = command.ExecuteReader();
+    using SqlDataReader reader = await command.ExecuteReaderAsync();
 
-    while (reader.Read())
+    while (await reader.ReadAsync()) // Ensure async reading
     {
-        string databaseName = reader.GetString(0);
+        databaseNames.Add(reader.GetString(0));
+    }
+
+    reader.Close(); // Close reader before executing new commands
+
+    // Step 2: Execute backup commands separately
+    foreach (string databaseName in databaseNames)
+    {
         string backupPath = Path.Combine(backupDir, $"{databaseName}.bak");
 
-        using var backupCommand = new SqlCommand($"BACKUP DATABASE [{databaseName}] TO DISK = '{backupPath}'", connection);
-        backupCommand.ExecuteNonQuery();
-        WriteLine($"✔ Backup completed for {databaseName}");
+        using SqlCommand backupCommand = new($"BACKUP DATABASE [{databaseName}] TO DISK = '{backupPath}'", connection);
+        await backupCommand.ExecuteNonQueryAsync();
+        Console.WriteLine($"✔ Backup completed for {databaseName}");
     }
 }
+
 
 async Task UploadToMinIO(string endpoint, string accessKey, string secretKey, string bucketName, string filePath)
 {
